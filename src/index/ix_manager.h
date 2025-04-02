@@ -12,6 +12,8 @@ See the Mulan PSL v2 for more details. */
 
 #include <memory>
 #include <string>
+#include <mutex>
+#include <iostream>
 
 #include "system/sm_meta.h"
 #include "ix_defs.h"
@@ -21,6 +23,7 @@ class IxManager {
    private:
     DiskManager *disk_manager_;
     BufferPoolManager *buffer_pool_manager_;
+    std::mutex fd_mutex_;
 
    public:
     IxManager(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager)
@@ -92,6 +95,8 @@ class IxManager {
         fhdr->serialize(data);
 
         disk_manager_->write_page(fd, IX_FILE_HDR_PAGE, data, fhdr->tot_len_);
+        
+        delete[] data;
 
         char page_buf[PAGE_SIZE];  // 在内存中初始化page_buf中的内容，然后将其写入磁盘
         memset(page_buf, 0, PAGE_SIZE);
@@ -147,6 +152,10 @@ class IxManager {
     std::unique_ptr<IxIndexHandle> open_index(const std::string &filename, const std::vector<ColMeta>& index_cols) {
         std::string ix_name = get_index_name(filename, index_cols);
         int fd = disk_manager_->open_file(ix_name);
+        
+        // 添加日志
+        std::cout << "DEBUG: Opening index " << ix_name << " with fd=" << fd << std::endl;
+        
         return std::make_unique<IxIndexHandle>(disk_manager_, buffer_pool_manager_, fd);
     }
 
@@ -156,12 +165,18 @@ class IxManager {
         return std::make_unique<IxIndexHandle>(disk_manager_, buffer_pool_manager_, fd);
     }
 
-    void close_index(const IxIndexHandle *ih) {
-        char* data = new char[ih->file_hdr_->tot_len_];
-        ih->file_hdr_->serialize(data);
-        disk_manager_->write_page(ih->fd_, IX_FILE_HDR_PAGE, data, ih->file_hdr_->tot_len_);
-        // 缓冲区的所有页刷到磁盘，注意这句话必须写在close_file前面
+    void close_index(IxIndexHandle *ih) {
+        if (!ih || ih->fd_ == -1) return;
+        
+        std::lock_guard<std::mutex> lock(fd_mutex_);
+        
+        // 先输出有效fd
+        std::cout << "DEBUG: Closing index with fd=" << ih->fd_ << std::endl;
+        
         buffer_pool_manager_->flush_all_pages(ih->fd_);
         disk_manager_->close_file(ih->fd_);
+        ih->fd_ = -1;  // 然后再设置为-1
+        
+        std::cout << "DEBUG: Index closed" << std::endl;
     }
 };

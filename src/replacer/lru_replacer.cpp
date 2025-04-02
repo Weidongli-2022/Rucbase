@@ -25,10 +25,24 @@ bool LRUReplacer::victim(frame_id_t* frame_id) {
     std::scoped_lock lock{latch_};  //  如果编译报错可以替换成其他lock
 
     // Todo:
-    //  利用lru_replacer中的LRUlist_,LRUHash_实现LRU策略
+    //  利用lru_replacer中的LRUlist_, LRUhash_实现LRU策略
     //  选择合适的frame指定为淘汰页面,赋值给*frame_id
-
-    return true;
+    
+    // 检查是否有可淘汰的页面
+    if (LRUlist_.empty()) {
+        return false;  // 没有可淘汰的页面
+    }
+    
+    // 获取最久未使用的页面（链表尾部）
+    *frame_id = LRUlist_.back();  // 取出链表尾部元素的帧ID
+    
+    // 从哈希表中移除该帧
+     LRUhash_.erase(*frame_id);
+    
+    // 从链表中移除该帧
+    LRUlist_.pop_back();
+    
+    return true;  // 成功淘汰一个页面
 }
 
 /**
@@ -40,6 +54,17 @@ void LRUReplacer::pin(frame_id_t frame_id) {
     // Todo:
     // 固定指定id的frame
     // 在数据结构中移除该frame
+    
+    // 检查该帧是否在LRU列表中
+    auto iter =  LRUhash_.find(frame_id);
+    if (iter !=  LRUhash_.end()) {
+        // 找到了该帧，从链表中删除
+        LRUlist_.erase(iter->second);
+        
+        // 从哈希表中删除
+         LRUhash_.erase(iter);
+    }
+    // 如果不在列表中，说明已经被固定，无需操作
 }
 
 /**
@@ -50,6 +75,23 @@ void LRUReplacer::unpin(frame_id_t frame_id) {
     // Todo:
     //  支持并发锁
     //  选择一个frame取消固定
+    
+    std::scoped_lock lock{latch_};  // 加锁确保线程安全
+    
+    // 检查该帧是否已在LRU列表中
+    if ( LRUhash_.find(frame_id) !=  LRUhash_.end()) {
+        // 已经在列表中，无需重复添加
+        return;
+    }
+    
+    // 如果LRU列表已满，可以根据需求选择是否淘汰一个帧
+    // 本实现中不做处理，因为实际使用中LRUlist_的大小不会超过max_size_
+    
+    // 将帧添加到链表头部（表示最近使用）
+    LRUlist_.push_front(frame_id);
+    
+    // 在哈希表中记录该帧在链表中的位置
+      LRUhash_[frame_id] = LRUlist_.begin();
 }
 
 /**

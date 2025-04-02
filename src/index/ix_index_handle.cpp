@@ -12,6 +12,10 @@ See the Mulan PSL v2 for more details. */
 
 #include "ix_scan.h"
 
+
+
+
+
 /**
  * @brief 在当前node中查找第一个>=target的key_idx
  *
@@ -64,12 +68,18 @@ bool IxNodeHandle::leaf_lookup(const char *key, Rid **value) {
  * @return page_id_t 目标key所在的孩子节点（子树）的存储页面编号
  */
 page_id_t IxNodeHandle::internal_lookup(const char *key) {
-    // Todo:
-    // 1. 查找当前非叶子节点中目标key所在孩子节点（子树）的位置
-    // 2. 获取该孩子节点（子树）所在页面的编号
-    // 3. 返回页面编号
-
-    return -1;
+    // 查找当前非叶子节点中目标key所在孩子节点的位置
+    int pos = upper_bound(key);
+    
+    // 因为我们需要找的是key应该在哪个子树，而每个key右边的指针指向的子树中所有键>=该key
+    // 所以我们找到第一个>key的位置，然后取它前一个指针
+    pos = pos - 1;
+    
+    // 获取该位置对应的子节点页面编号
+    Rid *rid = get_rid(pos);
+    
+    // 返回页面编号
+    return rid->page_no;
 }
 
 /**
@@ -122,7 +132,22 @@ void IxNodeHandle::erase_pair(int pos) {
     // 1. 删除该位置的key
     // 2. 删除该位置的rid
     // 3. 更新结点的键值对数量
-
+    
+    if (pos < 0 || pos >= get_size()) {
+        return;  // Invalid position
+    }
+    
+    int key_size = get_max_size();
+    int rid_size = sizeof(Rid);
+    
+    // 删除该位置的key和rid（通过将后面的键值对前移）
+    if (pos < get_size() - 1) {
+        memmove(get_key(pos), get_key(pos + 1), key_size * (get_size() - pos - 1));
+        memmove(get_rid(pos), get_rid(pos + 1), rid_size * (get_size() - pos - 1));
+    }
+    
+    // 更新结点的键值对数量
+    set_size(get_size() - 1);
 }
 
 /**
@@ -136,8 +161,17 @@ int IxNodeHandle::remove(const char *key) {
     // 1. 查找要删除键值对的位置
     // 2. 如果要删除的键值对存在，删除键值对
     // 3. 返回完成删除操作后的键值对数量
-
-    return -1;
+    
+    // 1. 查找要删除键值对的位置
+    int pos = lower_bound(key);
+    
+    // 2. 如果要删除的键值对存在，删除键值对
+    if (pos < get_size() && ix_compare(key, get_key(pos), file_hdr->col_types_, file_hdr->col_lens_) == 0) {
+        erase_pair(pos);
+    }
+    
+    // 3. 返回完成删除操作后的键值对数量
+    return get_size();
 }
 
 IxIndexHandle::IxIndexHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, int fd)
@@ -170,8 +204,34 @@ std::pair<IxNodeHandle *, bool> IxIndexHandle::find_leaf_page(const char *key, O
     // 1. 获取根节点
     // 2. 从根节点开始不断向下查找目标key
     // 3. 找到包含该key值的叶子结点停止查找，并返回叶子节点
-
-    return std::make_pair(nullptr, false);
+    
+    // 对整棵树加锁
+    tree_latch_.lock();
+    bool root_is_latched = true;
+    
+    // 1. 获取根节点
+    IxNodeHandle *node = fetch_node(file_hdr_->root_page_);
+    
+    // 2. 从根节点开始不断向下查找目标key
+    while (!node->is_leaf_page()) {
+        page_id_t child_page_no = node->internal_lookup(key);
+        // 释放当前节点
+        buffer_pool_manager_->unpin_page(node->get_page_id(), false);
+        delete node;
+        // 获取子节点
+        node = fetch_node(child_page_no);
+    }
+    
+    // 3. 找到包含该key值的叶子结点
+    
+    // 对于读操作，立即释放树锁
+    if (operation == Operation::FIND) {
+        tree_latch_.unlock();
+        root_is_latched = false;
+    }
+    
+    // 返回叶子节点和根节点锁状态
+    return {node, root_is_latched};
 }
 
 /**
@@ -183,13 +243,47 @@ std::pair<IxNodeHandle *, bool> IxIndexHandle::find_leaf_page(const char *key, O
  * @return bool 返回目标键值对是否存在
  */
 bool IxIndexHandle::get_value(const char *key, std::vector<Rid> *result, Transaction *transaction) {
+    if (fd_ < 0) {
+        std::cerr << "ERROR: Index handle has invalid fd: " << fd_ << std::endl;
+        return false;
+    }
+
+    std::cout << "Getting value for key at fd=" << fd_ << std::endl;
     // Todo:
     // 1. 获取目标key值所在的叶子结点
     // 2. 在叶子节点中查找目标key值的位置，并读取key对应的rid
     // 3. 把rid存入result参数中
     // 提示：使用完buffer_pool提供的page之后，记得unpin page；记得处理并发的上锁
-
-    return false;
+    
+    // 加读锁
+    std::unique_lock<std::mutex> lock(tree_latch_);
+    
+    // 1. 获取目标key值所在的叶子结点
+    IxNodeHandle *leaf = fetch_node(file_hdr_->root_page_);
+    while (!leaf->is_leaf_page()) {
+        page_id_t child_page_no = leaf->internal_lookup(key);
+        buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+        delete leaf;
+        leaf = fetch_node(child_page_no);
+    }
+    
+    // 找到叶子节点后可以释放锁，允许其他读操作
+    lock.unlock();
+    
+    // 2. 在叶子节点中查找目标key值的位置
+    Rid *rid = nullptr;
+    bool found = leaf->leaf_lookup(key, &rid);
+    
+    // 3. 把rid存入result参数中
+    if (found) {
+        result->push_back(*rid);
+    }
+    
+    // 释放叶子节点
+    buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+    delete leaf;
+    
+    return found;
 }
 
 /**
@@ -245,8 +339,56 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
     // 2. 在该叶子节点中插入键值对
     // 3. 如果结点已满，分裂结点，并把新结点的相关信息插入父节点
     // 提示：记得unpin page；若当前叶子节点是最右叶子节点，则需要更新file_hdr_.last_leaf；记得处理并发的上锁
-
-    return -1;
+    
+    // 加写锁
+    std::unique_lock<std::mutex> lock(tree_latch_);
+    
+    // 1. 查找key值应该插入到哪个叶子节点
+    IxNodeHandle *leaf = fetch_node(file_hdr_->root_page_);
+    while (!leaf->is_leaf_page()) {
+        page_id_t child_page_no = leaf->internal_lookup(key);
+        buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+        delete leaf;
+        leaf = fetch_node(child_page_no);
+    }
+    
+    // 2. 在该叶子节点中插入键值对
+    int size_before_insert = leaf->get_size();
+    int size_after_insert = leaf->insert(key, value);
+    
+    if (size_before_insert == size_after_insert) {
+        // 插入失败，可能是键已存在
+        buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+        delete leaf;
+        return -1;
+    }
+    
+    // 3. 如果结点已满，分裂结点，并把新结点的相关信息插入父节点
+    if (size_after_insert >= leaf->get_max_size()) {
+        // 节点已满，需要分裂
+        IxNodeHandle *new_node = split(leaf);
+        
+        // 更新最右叶子节点
+        if (leaf->get_page_no() == file_hdr_->last_leaf_) {
+            file_hdr_->last_leaf_ = new_node->get_page_no();
+        }
+        
+        // 插入父节点
+        insert_into_parent(leaf, new_node->get_key(0), new_node, transaction);
+        
+        // 释放新节点
+        buffer_pool_manager_->unpin_page(new_node->get_page_id(), true);
+        delete new_node;
+    }
+    
+    page_id_t leaf_page_no = leaf->get_page_no();
+    
+    // 释放叶子节点
+    buffer_pool_manager_->unpin_page(leaf->get_page_id(), true);
+    delete leaf;
+    
+    // 锁会在函数结束时自动释放
+    return leaf_page_no;
 }
 
 /**
@@ -260,8 +402,44 @@ bool IxIndexHandle::delete_entry(const char *key, Transaction *transaction) {
     // 2. 在该叶子结点中删除键值对
     // 3. 如果删除成功需要调用CoalesceOrRedistribute来进行合并或重分配操作，并根据函数返回结果判断是否有结点需要删除
     // 4. 如果需要并发，并且需要删除叶子结点，则需要在事务的delete_page_set中添加删除结点的对应页面；记得处理并发的上锁
-
-    return false;
+    
+    // 加写锁
+    std::unique_lock<std::mutex> lock(tree_latch_);
+    
+    // 1. 获取该键值对所在的叶子结点
+    IxNodeHandle *leaf = fetch_node(file_hdr_->root_page_);
+    while (!leaf->is_leaf_page()) {
+        page_id_t child_page_no = leaf->internal_lookup(key);
+        buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+        delete leaf;
+        leaf = fetch_node(child_page_no);
+    }
+    
+    // 2. 在该叶子结点中删除键值对
+    int size_before_deletion = leaf->get_size();
+    int size_after_deletion = leaf->remove(key);
+    
+    bool deleted = (size_before_deletion > size_after_deletion);
+    
+    // 如果删除失败，直接返回
+    if (!deleted) {
+        buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+        delete leaf;
+        return false;
+    }
+    
+    // 3. 如果删除成功需要调用CoalesceOrRedistribute来进行合并或重分配操作
+    bool dummy_root_is_latched = false; // 由于我们使用树级锁，这个变量不会被使用
+    if (size_after_deletion < leaf->get_min_size()) {
+        coalesce_or_redistribute(leaf, transaction, &dummy_root_is_latched);
+    }
+    
+    // 释放叶子节点
+    buffer_pool_manager_->unpin_page(leaf->get_page_id(), true);
+    delete leaf;
+    
+    // 锁会在函数结束时自动释放
+    return deleted;
 }
 
 /**
@@ -285,8 +463,49 @@ bool IxIndexHandle::coalesce_or_redistribute(IxNodeHandle *node, Transaction *tr
     // 4. 如果node结点和兄弟结点的键值对数量之和，能够支撑两个B+树结点（即node.size+neighbor.size >=
     // NodeMinSize*2)，则只需要重新分配键值对（调用Redistribute函数）
     // 5. 如果不满足上述条件，则需要合并两个结点，将右边的结点合并到左边的结点（调用Coalesce函数）
-
-    return false;
+    
+    // 1. 判断node结点是否为根节点
+    if (node->get_page_no() == file_hdr_->root_page_) {
+        // 1.1 如果是根节点，需要调用AdjustRoot()函数来进行处理
+        return adjust_root(node);
+    }
+    
+    // 1.2 如果不是根节点，判断是否需要执行合并或重分配操作
+    if (node->get_size() >= node->get_min_size()) {
+        return false;  // 不需要合并或重分配
+    }
+    
+    // 2. 获取node结点的父亲结点
+    IxNodeHandle *parent = fetch_node(node->get_parent_page_no());
+    
+    // 找到node在parent中的位置
+    int index = parent->find_child(node);
+    
+    // 3. 寻找node结点的兄弟结点（优先选取前驱结点）
+    IxNodeHandle *neighbor_node;
+    if (index == 0) {
+        // Node是最左边的孩子，必须使用右兄弟
+        neighbor_node = fetch_node(parent->value_at(index + 1));
+    } else {
+        // 使用左兄弟（前驱）
+        neighbor_node = fetch_node(parent->value_at(index - 1));
+    }
+    
+    // 4. 判断是重分配还是合并
+    bool should_delete;
+    if (node->get_size() + neighbor_node->get_size() >= node->get_min_size() * 2) {
+        // 键值对数量足够支撑两个结点，进行重分配
+        redistribute(neighbor_node, node, parent, index);
+        should_delete = false;
+    } else {
+        // 键值对数量不够支撑两个结点，进行合并
+        should_delete = coalesce(&neighbor_node, &node, &parent, index, transaction, root_is_latched);
+    }
+    
+    // 释放父结点
+    buffer_pool_manager_->unpin_page(parent->get_page_id(), true);
+    
+    return should_delete;
 }
 
 /**
@@ -300,7 +519,42 @@ bool IxIndexHandle::adjust_root(IxNodeHandle *old_root_node) {
     // 1. 如果old_root_node是内部结点，并且大小为1，则直接把它的孩子更新成新的根结点
     // 2. 如果old_root_node是叶结点，且大小为0，则直接更新root page
     // 3. 除了上述两种情况，不需要进行操作
-
+    
+    // 1. 如果old_root_node是内部结点，并且大小为1，则直接把它的孩子更新成新的根结点
+    if (!old_root_node->is_leaf_page() && old_root_node->get_size() == 0) {
+        // 获取唯一的孩子结点
+        page_id_t child_page_no = old_root_node->value_at(0);
+        IxNodeHandle *child = fetch_node(child_page_no);
+        
+        // 将孩子结点设为新的根结点
+        child->set_parent_page_no(INVALID_PAGE_ID);
+        file_hdr_->root_page_ = child_page_no;
+        
+        // 释放旧的根结点
+        release_node_handle(*old_root_node);
+        buffer_pool_manager_->unpin_page(child->get_page_id(), true);
+        buffer_pool_manager_->delete_page(old_root_node->get_page_id());
+        
+        return true;
+    }
+    
+    // 2. 如果old_root_node是叶结点，且大小为0，则直接更新root page
+    if (old_root_node->is_leaf_page() && old_root_node->get_size() == 0) {
+        // 设置根页面为无效
+        file_hdr_->root_page_ = INVALID_PAGE_ID;
+        
+        // 更新first_leaf和last_leaf
+        file_hdr_->first_leaf_ = INVALID_PAGE_ID;
+        file_hdr_->last_leaf_ = INVALID_PAGE_ID;
+        
+        // 释放根结点
+        release_node_handle(*old_root_node);
+        buffer_pool_manager_->delete_page(old_root_node->get_page_id());
+        
+        return true;
+    }
+    
+    // 3. 除了上述两种情况，不需要进行操作
     return false;
 }
 
@@ -324,31 +578,69 @@ void IxIndexHandle::redistribute(IxNodeHandle *neighbor_node, IxNodeHandle *node
     // 2. 从neighbor_node中移动一个键值对到node结点中
     // 3. 更新父节点中的相关信息，并且修改移动键值对对应孩字结点的父结点信息（maintain_child函数）
     // 注意：neighbor_node的位置不同，需要移动的键值对不同，需要分类讨论
-}
-
-/**
- * @brief 合并(Coalesce)函数是将node和其直接前驱进行合并，也就是和它左边的neighbor_node进行合并；
- * 假设node一定在右边。如果上层传入的index=0，说明node在左边，那么交换node和neighbor_node，保证node在右边；合并到左结点，实际上就是删除了右结点；
- * Move all the key & value pairs from one page to its sibling page, and notify buffer pool manager to delete this page.
- * Parent page must be adjusted to take info of deletion into account. Remember to deal with coalesce or redistribute
- * recursively if necessary.
- *
- * @param neighbor_node sibling page of input "node" (neighbor_node是node的前结点)
- * @param node input from method coalesceOrRedistribute() (node结点是需要被删除的)
- * @param parent parent page of input "node"
- * @param index node在parent中的rid_idx
- * @return true means parent node should be deleted, false means no deletion happend
- * @note Assume that *neighbor_node is the left sibling of *node (neighbor -> node)
- */
-bool IxIndexHandle::coalesce(IxNodeHandle **neighbor_node, IxNodeHandle **node, IxNodeHandle **parent, int index,
-                             Transaction *transaction, bool *root_is_latched) {
-    // Todo:
-    // 1. 用index判断neighbor_node是否为node的前驱结点，若不是则交换两个结点，让neighbor_node作为左结点，node作为右结点
-    // 2. 把node结点的键值对移动到neighbor_node中，并更新node结点孩子结点的父节点信息（调用maintain_child函数）
-    // 3. 释放和删除node结点，并删除parent中node结点的信息，返回parent是否需要被删除
-    // 提示：如果是叶子结点且为最右叶子结点，需要更新file_hdr_.last_leaf
-
-    return false;
+    
+    // 1. 判断neighbor_node是node的前驱还是后继
+    bool neighbor_is_predecessor = (index > 0);
+    
+    if (neighbor_is_predecessor) {
+        // neighbor_node是node的前驱，将neighbor_node的最后一个键值对移动到node的开头
+        if (node->is_leaf_page()) {
+            // 叶子结点情况
+            int last_idx = neighbor_node->get_size() - 1;
+            
+            // 将neighbor_node的最后一个键值对移动到node的开头
+            node->insert_pair(0, neighbor_node->get_key(last_idx), *neighbor_node->get_rid(last_idx));
+            neighbor_node->erase_pair(last_idx);
+            
+            // 更新父结点中的分隔键
+            parent->set_key(index, node->get_key(0));
+        } else {
+            // 非叶子结点情况
+            int last_idx = neighbor_node->get_size() - 1;
+            
+            // 从父结点获取分隔键
+            char *parent_key = parent->get_key(index);
+            
+            // 将父结点的分隔键和neighbor_node的最后一个孩子指针移动到node的开头
+            node->insert_pair(0, parent_key, *neighbor_node->get_rid(neighbor_node->get_size()));
+            
+            // 更新移动过来的孩子的父指针
+            maintain_child(node, 0);
+            
+            // 更新父结点的分隔键为neighbor_node的最后一个键
+            parent->set_key(index, neighbor_node->get_key(last_idx));
+            
+            // 删除neighbor_node的最后一个键值对
+            neighbor_node->erase_pair(last_idx);
+        }
+    } else {
+        // neighbor_node是node的后继，将neighbor_node的第一个键值对移动到node的末尾
+        if (node->is_leaf_page()) {
+            // 叶子结点情况
+            // 将neighbor_node的第一个键值对移动到node的末尾
+            node->insert_pair(node->get_size(), neighbor_node->get_key(0), *neighbor_node->get_rid(0));
+            neighbor_node->erase_pair(0);
+            
+            // 更新父结点中的分隔键
+            parent->set_key(index + 1, neighbor_node->get_key(0));
+        } else {
+            // 非叶子结点情况
+            // 从父结点获取分隔键
+            char *parent_key = parent->get_key(index + 1);
+            
+            // 将父结点的分隔键和neighbor_node的第一个孩子指针移动到node的末尾
+            node->insert_pair(node->get_size(), parent_key, *neighbor_node->get_rid(0));
+            
+            // 更新移动过来的孩子的父指针
+            maintain_child(node, node->get_size() - 1);
+            
+            // 更新父结点的分隔键为neighbor_node的第一个键
+            parent->set_key(index + 1, neighbor_node->get_key(0));
+            
+            // 删除neighbor_node的第一个键值对
+            neighbor_node->erase_pair(0);
+        }
+    }
 }
 
 /**
@@ -513,4 +805,86 @@ void IxIndexHandle::maintain_child(IxNodeHandle *node, int child_idx) {
         child->set_parent_page_no(node->get_page_no());
         buffer_pool_manager_->unpin_page(child->get_page_id(), true);
     }
+}
+
+/**
+ * @brief 合并(Coalesce)函数是将node和其直接前驱进行合并，也就是和它左边的neighbor_node进行合并；
+ * 假设node一定在右边。如果上层传入的index=0，说明node在左边，那么交换node和neighbor_node，保证node在右边；合并到左结点，实际上就是删除了右结点；
+ * Move all the key & value pairs from one page to its sibling page, and notify buffer pool manager to delete this page.
+ * Parent page must be adjusted to take info of deletion into account. Remember to deal with coalesce or redistribute
+ * recursively if necessary.
+ *
+ * @param neighbor_node sibling page of input "node" (neighbor_node是node的前结点)
+ * @param node input from method coalesceOrRedistribute() (node结点是需要被删除的)
+ * @param parent parent page of input "node"
+ * @param index node在parent中的rid_idx
+ * @return true means parent node should be deleted, false means no deletion happend
+ * @note Assume that *neighbor_node is the left sibling of *node (neighbor -> node)
+ */
+bool IxIndexHandle::coalesce(IxNodeHandle **neighbor_node, IxNodeHandle **node, IxNodeHandle **parent, int index,
+                             Transaction *transaction, bool *root_is_latched) {
+    // Todo:
+    // 1. 用index判断neighbor_node是否为node的前驱结点，若不是则交换两个结点，让neighbor_node作为左结点，node作为右结点
+    // 2. 把node结点的键值对移动到neighbor_node中，并更新node结点孩子结点的父节点信息（调用maintain_child函数）
+    // 3. 释放和删除node结点，并删除parent中node结点的信息，返回parent是否需要被删除
+    // 提示：如果是叶子结点且为最右叶子结点，需要更新file_hdr_.last_leaf
+    
+    // 1. 确保neighbor_node是node的前驱结点
+    bool neighbor_is_predecessor = (index > 0);
+    
+    if (!neighbor_is_predecessor) {
+        // 如果neighbor不是node的前驱，则交换两个结点
+        std::swap(*neighbor_node, *node);
+        index = 1;  // 交换后，node现在是右结点，对应parent中index+1的位置
+    }
+    
+    IxNodeHandle *left_node = *neighbor_node;
+    IxNodeHandle *right_node = *node;
+    
+    // 2. 将右结点(node)的所有键值对移动到左结点(neighbor_node)
+    int neighbor_size = left_node->get_size();
+    
+    if (left_node->is_leaf_page()) {
+        // 叶子结点情况
+        // 将右结点的所有键值对复制到左结点
+        left_node->insert_pairs(neighbor_size, right_node->get_key(0), right_node->get_rid(0), right_node->get_size());
+        
+        // 更新叶子结点链表
+        left_node->set_next_leaf(right_node->get_next_leaf());
+        
+        // 如果right_node是最右叶子结点，更新file_hdr_
+        if (right_node->get_page_no() == file_hdr_->last_leaf_) {
+            file_hdr_->last_leaf_ = left_node->get_page_no();
+        }
+    } else {
+        // 内部结点情况
+        // 先将父结点中对应的分隔键移动到左结点末尾
+        char *parent_key = (*parent)->get_key(index);
+        left_node->insert_pair(neighbor_size, parent_key, *right_node->get_rid(0));
+        
+        // 更新孩子结点的父指针
+        maintain_child(left_node, neighbor_size);
+        
+        // 将右结点的所有键值对移动到左结点
+        left_node->insert_pairs(neighbor_size + 1, right_node->get_key(0), right_node->get_rid(1), right_node->get_size());
+        
+        // 更新所有移动过来的孩子的父指针
+        for (int i = 0; i < right_node->get_size(); i++) {
+            maintain_child(left_node, neighbor_size + 1 + i);
+        }
+    }
+    
+    // 3. 从parent中删除右结点的索引
+    (*parent)->erase_pair(index);
+    
+    // 释放右结点
+    release_node_handle(*right_node);
+    buffer_pool_manager_->delete_page(right_node->get_page_id());
+    
+    // 判断父结点是否需要合并或重分配
+    if ((*parent)->get_size() < (*parent)->get_min_size()) {
+        return coalesce_or_redistribute(*parent, transaction, root_is_latched);
+    }
+    
+    return false;
 }

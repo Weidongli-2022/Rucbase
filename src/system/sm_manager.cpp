@@ -9,6 +9,11 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "sm_manager.h"
+#include "sm_defs.h"
+#include "index/ix_manager.h"
+#include "record/rm_manager.h"
+#include "transaction/transaction.h"
+#include "errors.h"  // 包含错误定义
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -197,8 +202,106 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
  * @param {vector<string>&} col_names 索引包含的字段名称
  * @param {Context*} context
  */
-void SmManager::create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
+void SmManager::create_index(const std::string &tab_name, 
+                           const std::vector<std::string> &col_names,
+                           Context *context) {
+    // 1. 创建IxManager实例
+    IxManager ix_manager(disk_manager_, buffer_pool_manager_);
     
+    // 2. 检查表是否存在并获取表元数据
+    TabMeta &tab = db_.get_table(tab_name);
+    if (tab.name.empty()) {
+        throw TableNotFoundError(tab_name);
+    }
+    
+    // 3. 检查索引是否已存在
+    if (tab.is_index(col_names)) {
+        throw IndexExistsError(tab_name, col_names);
+    }
+    
+    // 4. 获取列元数据
+    std::vector<ColMeta> idx_cols;
+    for (const auto &col_name : col_names) {
+        auto col_iter = tab.get_col(col_name);
+        if (col_iter == tab.cols.end()) {
+            throw ColumnNotFoundError(col_name);
+        }
+        idx_cols.push_back(*col_iter);
+    }
+    
+    try {
+        // 1. 构造文件名
+        std::string base_name = tab_name + ".0";
+        std::string index_file_path = base_name + "_" + col_names[0] + ".idx";
+        
+        std::cout << "Creating index file: " << index_file_path << std::endl;
+        
+        // 2. 确保文件不存在
+        if (disk_manager_->is_file(index_file_path)) {
+            disk_manager_->destroy_file(index_file_path);
+        }
+        
+        // 3. 创建文件
+        disk_manager_->create_file(index_file_path);
+        
+        // 4. 打开文件获取文件描述符
+        int fd = disk_manager_->open_file(index_file_path);
+        
+        // 5. 创建并初始化文件头
+        char header_page[PAGE_SIZE] = {0};  // 初始化为0
+        IxFileHdr file_hdr;
+        file_hdr.root_page_ = INVALID_PAGE_ID;  // 初始化根页面ID
+        file_hdr.num_pages_ = 1;  // 初始只有头页面
+        file_hdr.tot_len_ = sizeof(IxFileHdr);  // 设置正确的总长度
+        
+        // 序列化文件头
+        file_hdr.serialize(header_page);
+        
+        // 写入文件头页面
+        disk_manager_->write_page(fd, 0, header_page, PAGE_SIZE);
+        
+        // 关闭文件以确保数据写入磁盘
+        disk_manager_->close_file(fd);
+        
+        // 6. 现在使用 IxManager 创建索引
+        ix_manager.create_index(index_file_path, idx_cols);
+        
+        // 7. 添加索引元数据
+        IndexMeta idx_meta;
+        idx_meta.col_num = col_names.size();
+        idx_meta.cols = idx_cols;
+        tab.indexes.push_back(idx_meta);
+        
+        // 8. 打开索引进行记录插入
+        auto ix_handle = ix_manager.open_index(base_name, idx_cols);
+        auto fh = fhs_.at(tab_name).get();
+        
+        // 9. 插入记录
+        for (RmScan rmScan(fh); !rmScan.is_end(); rmScan.next()) {
+            auto rid = rmScan.rid();
+            auto record = fh->get_record(rid, context);
+            
+            // 构造索引键
+            int total_len = 0;
+            for (const auto &col : idx_cols) {
+                total_len += col.len;
+            }
+            char *key = new char[total_len];
+            int offset = 0;
+            for (const auto &col : idx_cols) {
+                memcpy(key + offset, record->data + col.offset, col.len);
+                offset += col.len;
+            }
+            
+            // 插入索引项
+            ix_handle->insert_entry(key, rid, nullptr);
+            delete[] key;
+        }
+        
+    } catch (const std::exception &e) {
+        std::cerr << "Error in create_index: " << e.what() << std::endl;
+        throw;
+    }
 }
 
 /**
@@ -220,3 +323,4 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<std::s
 void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMeta>& cols, Context* context) {
     
 }
+

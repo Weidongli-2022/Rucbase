@@ -90,10 +90,9 @@ class DiskManager {
     static constexpr int MAX_FD = 8192;
 
    private:
-    // 文件打开列表，用于记录文件是否被打开
-    std::unordered_map<std::string, int> path2fd_;  //<Page文件磁盘路径,Page fd>哈希表
-    std::unordered_map<int, std::string> fd2path_;  //<Page fd,Page文件磁盘路径>哈希表
-
-    int log_fd_ = -1;                             // WAL日志文件的文件句柄，默认为-1，代表未打开日志文件
-    std::atomic<page_id_t> fd2pageno_[MAX_FD]{};  // 文件中已经分配的页面个数，初始值为0
+    bool fd_occupied_[MAX_FD];  // 标记文件描述符是否被占用
+    std::unordered_map<int, std::string> fd2path_;  // 文件描述符到文件路径的映射
+    std::unordered_map<std::string, int> path2fd_;  // 文件路径到文件描述符的映射
+    page_id_t fd2pageno_[MAX_FD];  // 文件描述符到当前页号的映射
+    int log_fd_ = -1;  // 日志文件描述符
 };

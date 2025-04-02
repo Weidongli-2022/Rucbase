@@ -11,118 +11,279 @@ See the Mulan PSL v2 for more details. */
 #include "buffer_pool_manager.h"
 
 /**
- * @description: 从free_list或replacer中得到可淘汰帧页的 *frame_id
- * @return {bool} true: 可替换帧查找成功 , false: 可替换帧查找失败
- * @param {frame_id_t*} frame_id 帧页id指针,返回成功找到的可替换帧id
+ * @description: 寻找一个可替换的帧
+ * @param {frame_id_t*} frame_id 如果找到，则存储可替换帧的帧号
+ * @return {bool} 是否找到可替换帧
  */
 bool BufferPoolManager::find_victim_page(frame_id_t* frame_id) {
-    // Todo:
-    // 1 使用BufferPoolManager::free_list_判断缓冲池是否已满需要淘汰页面
-    // 1.1 未满获得frame
-    // 1.2 已满使用lru_replacer中的方法选择淘汰页面
-
+    // 首先检查是否有空闲帧可用
+    if (!free_list_.empty()) {
+        // 有空闲帧，直接使用
+        *frame_id = free_list_.front();
+        free_list_.pop_front();
+        return true;
+    }
+    
+    // 没有空闲帧，尝试使用replacer找到一个可淘汰的帧
+    if (replacer_->victim(frame_id)) {
+        // 找到了可淘汰的帧
+        Page* victim_page = &pages_[*frame_id];
+        
+        // 如果是脏页，需要先写回磁盘
+        if (victim_page->is_dirty_) {
+            disk_manager_->write_page(victim_page->id_.fd, 
+                                      victim_page->id_.page_no, 
+                                      victim_page->data_, 
+                                      PAGE_SIZE);
+            victim_page->is_dirty_ = false;
+        }
+        
+        // 从页表中删除对应的映射关系
+        page_table_.erase(victim_page->id_);
+        
+        return true;
+    }
+    
+    // 没有可用帧也没有可淘汰的帧
     return false;
 }
 
 /**
- * @description: 更新页面数据, 如果为脏页则需写入磁盘，再更新为新页面，更新page元数据(data, is_dirty, page_id)和page table
- * @param {Page*} page 写回页指针
- * @param {PageId} new_page_id 新的page_id
- * @param {frame_id_t} new_frame_id 新的帧frame_id
+ * @description: 更新页面的元数据
+ * @param {Page*} page 要更新的页面
+ * @param {PageId} new_page_id 新的页面id
+ * @param {frame_id_t} new_frame_id 新的帧id
  */
-void BufferPoolManager::update_page(Page *page, PageId new_page_id, frame_id_t new_frame_id) {
-    // Todo:
-    // 1 如果是脏页，写回磁盘，并且把dirty置为false
-    // 2 更新page table
-    // 3 重置page的data，更新page id
-
+void BufferPoolManager::update_page(Page* page, PageId new_page_id, frame_id_t new_frame_id) {
+    // 更新页面的id
+    page->id_ = new_page_id;
+    // 注意：Page类没有frame_id_成员变量，移除此行
+    // page->frame_id_ = new_frame_id; 
+    
+    // 在BufferPoolManager中，frame_id通过page_table_映射表维护
+    // 不需要在Page对象中直接存储
 }
 
 /**
- * @description: 从buffer pool获取需要的页。
- *              如果页表中存在page_id（说明该page在缓冲池中），并且pin_count++。
- *              如果页表不存在page_id（说明该page在磁盘中），则找缓冲池victim page，将其替换为磁盘中读取的page，pin_count置1。
- * @return {Page*} 若获得了需要的页则将其返回，否则返回nullptr
- * @param {PageId} page_id 需要获取的页的PageId
- */
-Page* BufferPoolManager::fetch_page(PageId page_id) {
-    //Todo:
-    // 1.     从page_table_中搜寻目标页
-    // 1.1    若目标页有被page_table_记录，则将其所在frame固定(pin)，并返回目标页。
-    // 1.2    否则，尝试调用find_victim_page获得一个可用的frame，若失败则返回nullptr
-    // 2.     若获得的可用frame存储的为dirty page，则须调用updata_page将page写回到磁盘
-    // 3.     调用disk_manager_的read_page读取目标页到frame
-    // 4.     固定目标页，更新pin_count_
-    // 5.     返回目标页
-    return nullptr;
-}
-
-/**
- * @description: 取消固定pin_count>0的在缓冲池中的page
- * @return {bool} 如果目标页的pin_count<=0则返回false，否则返回true
- * @param {PageId} page_id 目标page的page_id
- * @param {bool} is_dirty 若目标page应该被标记为dirty则为true，否则为false
- */
-bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
-    // Todo:
-    // 0. lock latch
-    // 1. 尝试在page_table_中搜寻page_id对应的页P
-    // 1.1 P在页表中不存在 return false
-    // 1.2 P在页表中存在，获取其pin_count_
-    // 2.1 若pin_count_已经等于0，则返回false
-    // 2.2 若pin_count_大于0，则pin_count_自减一
-    // 2.2.1 若自减后等于0，则调用replacer_的Unpin
-    // 3 根据参数is_dirty，更改P的is_dirty_
-    return true;
-}
-
-/**
- * @description: 将目标页写回磁盘，不考虑当前页面是否正在被使用
- * @return {bool} 成功则返回true，否则返回false(只有page_table_中没有目标页时)
- * @param {PageId} page_id 目标页的page_id，不能为INVALID_PAGE_ID
- */
-bool BufferPoolManager::flush_page(PageId page_id) {
-    // Todo:
-    // 0. lock latch
-    // 1. 查找页表,尝试获取目标页P
-    // 1.1 目标页P没有被page_table_记录 ，返回false
-    // 2. 无论P是否为脏都将其写回磁盘。
-    // 3. 更新P的is_dirty_
-   
-    return true;
-}
-
-/**
- * @description: 创建一个新的page，即从磁盘中移动一个新建的空page到缓冲池某个位置。
- * @return {Page*} 返回新创建的page，若创建失败则返回nullptr
- * @param {PageId*} page_id 当成功创建一个新的page时存储其page_id
+ * @description: 创建一个新的页面
+ * @param {PageId*} page_id 输出参数，新页面的id
+ * @return {Page*} 新页面的指针，如果创建失败则返回nullptr
  */
 Page* BufferPoolManager::new_page(PageId* page_id) {
-    // 1.   获得一个可用的frame，若无法获得则返回nullptr
-    // 2.   在fd对应的文件分配一个新的page_id
-    // 3.   将frame的数据写回磁盘
-    // 4.   固定frame，更新pin_count_
-    // 5.   返回获得的page
-   return nullptr;
+    std::lock_guard<std::mutex> lock(latch_);  // 加锁保证线程安全
+    
+    frame_id_t frame_id;
+    // 寻找可用帧
+    if (!find_victim_page(&frame_id)) {
+        // 没有可用帧
+        return nullptr;
+    }
+    
+    // 使用DiskManager分配页面号
+    page_id->page_no = disk_manager_->allocate_page(page_id->fd);
+    
+    // 获取对应帧的页面
+    Page* page = &pages_[frame_id];
+    
+    // 更新页面信息
+    update_page(page, *page_id, frame_id);
+    
+    // 初始化页面状态
+    page->pin_count_ = 1;  // 新页面被固定一次
+    page->is_dirty_ = false;  // 新页面初始不是脏页
+    
+    // 更新页表
+    page_table_[*page_id] = frame_id;
+    
+    // 通知替换器该帧已被固定
+    replacer_->pin(frame_id);
+    
+    return page;
 }
 
 /**
- * @description: 从buffer_pool删除目标页
- * @return {bool} 如果目标页不存在于buffer_pool或者成功被删除则返回true，若其存在于buffer_pool但无法删除则返回false
- * @param {PageId} page_id 目标页
+ * @description: 从缓冲池或磁盘获取指定页面
+ * @param {PageId} page_id 要获取的页面id
+ * @return {Page*} 页面指针，如果获取失败则返回nullptr
  */
-bool BufferPoolManager::delete_page(PageId page_id) {
-    // 1.   在page_table_中查找目标页，若不存在返回true
-    // 2.   若目标页的pin_count不为0，则返回false
-    // 3.   将目标页数据写回磁盘，从页表中删除目标页，重置其元数据，将其加入free_list_，返回true
+Page* BufferPoolManager::fetch_page(PageId page_id) {
+    std::lock_guard<std::mutex> lock(latch_);  // 加锁保证线程安全
+    
+    // 检查页面是否在缓冲池中
+    auto iter = page_table_.find(page_id);
+    if (iter != page_table_.end()) {
+        // 页面已在缓冲池中
+        frame_id_t frame_id = iter->second;
+        Page* page = &pages_[frame_id];
+        
+        // 增加页面引用计数
+        page->pin_count_++;
+        
+        // 通知替换器该帧已被固定
+        replacer_->pin(frame_id);
+        
+        return page;
+    }
+    
+    // 页面不在缓冲池中，需要从磁盘读取
+    
+    // 寻找可用帧
+    frame_id_t frame_id;
+    if (!find_victim_page(&frame_id)) {
+        // 没有可用帧
+        return nullptr;
+    }
+    
+    // 获取对应帧的页面
+    Page* page = &pages_[frame_id];
+    
+    // 更新页面信息
+    update_page(page, page_id, frame_id);
+    
+    // 从磁盘读取页面数据
+    disk_manager_->read_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
+    
+    // 初始化页面状态
+    page->pin_count_ = 1;  // 页面被固定一次
+    page->is_dirty_ = false;  // 从磁盘读取的页面初始不是脏页
+    
+    // 更新页表
+    page_table_[page_id] = frame_id;
+    
+    // 通知替换器该帧已被固定
+    replacer_->pin(frame_id);
+    
+    return page;
+}
+
+/**
+ * @description: 取消固定一个页面
+ * @param {PageId} page_id 要取消固定的页面id
+ * @param {bool} is_dirty 页面是否被修改
+ * @return {bool} 是否成功取消固定
+ */
+bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
+    std::lock_guard<std::mutex> lock(latch_);  // 加锁保证线程安全
+    
+    // 检查页面是否在缓冲池中
+    auto iter = page_table_.find(page_id);
+    if (iter == page_table_.end()) {
+        // 页面不在缓冲池中
+        return false;
+    }
+    
+    frame_id_t frame_id = iter->second;
+    Page* page = &pages_[frame_id];
+    
+    // 检查引用计数
+    if (page->pin_count_ <= 0) {
+        // 引用计数已为0，无法再次取消固定
+        return false;
+    }
+    
+    // 如果页面被修改，标记为脏页
+    if (is_dirty) {
+        page->is_dirty_ = true;
+    }
+    
+    // 减少引用计数
+    page->pin_count_--;
+    
+    // 如果引用计数减为0，通知替换器该帧可被替换
+    if (page->pin_count_ == 0) {
+        replacer_->unpin(frame_id);
+    }
     
     return true;
 }
 
 /**
- * @description: 将buffer_pool中的所有页写回到磁盘
- * @param {int} fd 文件句柄
+ * @description: 删除指定页面
+ * @param {PageId} page_id 要删除的页面id
+ * @return {bool} 是否成功删除
+ */
+bool BufferPoolManager::delete_page(PageId page_id) {
+    std::lock_guard<std::mutex> lock(latch_);  // 加锁保证线程安全
+    
+    // 检查页面是否在缓冲池中
+    auto iter = page_table_.find(page_id);
+    if (iter == page_table_.end()) {
+        // 页面不在缓冲池中，视为删除成功
+        return true;
+    }
+    
+    frame_id_t frame_id = iter->second;
+    Page* page = &pages_[frame_id];
+    
+    // 检查引用计数
+    if (page->pin_count_ > 0) {
+        // 页面仍在使用中，无法删除
+        return false;
+    }
+    
+    // 从页表中删除页面
+    page_table_.erase(page_id);
+    
+    // 重置页面状态
+    page->is_dirty_ = false;
+    page->id_.fd = INVALID_PAGE_ID;  // 使用无效值标记
+    page->id_.page_no = INVALID_PAGE_ID;
+    
+    // 将帧添加到空闲列表
+    free_list_.push_back(frame_id);
+    
+    // 从替换器中移除该帧（因为它现在是空闲的）
+    replacer_->pin(frame_id);  // 使用pin操作从替换器中移除
+    
+    return true;
+}
+
+/**
+ * @description: 将指定页面刷新到磁盘
+ * @param {PageId} page_id 要刷新的页面id
+ * @return {bool} 是否成功刷新
+ */
+bool BufferPoolManager::flush_page(PageId page_id) {
+    std::lock_guard<std::mutex> lock(latch_);  // 加锁保证线程安全
+    
+    // 检查页面是否在缓冲池中
+    auto iter = page_table_.find(page_id);
+    if (iter == page_table_.end()) {
+        // 页面不在缓冲池中
+        return false;
+    }
+    
+    frame_id_t frame_id = iter->second;
+    Page* page = &pages_[frame_id];
+    
+    // 无论页面是否为脏页，都将其写回磁盘
+    disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
+    
+    // 重置脏页标记
+    page->is_dirty_ = false;
+    
+    return true;
+}
+
+/**
+ * @description: 将指定文件的所有页面刷新到磁盘
+ * @param {int} fd 文件描述符
  */
 void BufferPoolManager::flush_all_pages(int fd) {
+    std::lock_guard<std::mutex> lock(latch_);  // 加锁保证线程安全
     
+    // 遍历所有页面
+    for (size_t i = 0; i < pool_size_; i++) {
+        Page* page = &pages_[i];
+        
+        // 检查页面是否属于指定文件
+        if (page->id_.fd == fd) {
+            // 无论页面是否为脏页，都将其写回磁盘
+            disk_manager_->write_page(fd, page->id_.page_no, page->data_, PAGE_SIZE);
+            
+            // 重置脏页标记
+            page->is_dirty_ = false;
+        }
+    }
 }
+

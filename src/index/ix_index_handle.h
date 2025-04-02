@@ -168,6 +168,7 @@ class IxIndexHandle {
     int fd_;                                    // 存储B+树的文件
     IxFileHdr* file_hdr_;                       // 存了root_page，但其初始化为2（第0页存FILE_HDR_PAGE，第1页存LEAF_HEADER_PAGE）
     std::mutex root_latch_;
+    std::mutex tree_latch_;  // 添加树级别的互斥锁
 
    public:
     IxIndexHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, int fd);
@@ -204,6 +205,14 @@ class IxIndexHandle {
     Iid leaf_end() const;
 
     Iid leaf_begin() const;
+
+    int get_fd() const { 
+        if (this == nullptr) {
+            std::cerr << "ERROR: Null pointer access in IxIndexHandle::get_fd()" << std::endl;
+            throw std::runtime_error("Null pointer access in IxIndexHandle::get_fd()");
+        }
+        return fd_; 
+    }
 
    private:
     // 辅助函数
